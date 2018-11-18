@@ -1,13 +1,35 @@
 package net.minecraft.launchwrapper;
 
-import java.io.*;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.JarURLConnection;
+import java.net.MalformedURLException;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
+import java.security.AccessController;
 import java.security.CodeSigner;
 import java.security.CodeSource;
-import java.util.*;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
+import java.security.SecureClassLoader;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.Attributes;
 import java.util.jar.Attributes.Name;
@@ -19,9 +41,15 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 
 public class LaunchClassLoader extends URLClassLoader {
+    static {
+        ClassLoader.registerAsParallelCapable();
+    }
+    
     public static final int BUFFER_SIZE = 1 << 12;
     private List<URL> sources;
+    
     private ClassLoader parent = getClass().getClassLoader();
+    private Class<? extends SecureClassLoader> loaderType; // Java 9
 
     private List<IClassTransformer> transformers = new ArrayList<IClassTransformer>(2);
     private Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<String, Class<?>>();
@@ -42,10 +70,55 @@ public class LaunchClassLoader extends URLClassLoader {
     private static final boolean DEBUG_FINER = DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingFiner", "false"));
     private static final boolean DEBUG_SAVE = DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingSave", "false"));
     private static File tempFolder = null;
+    
+    private static Method moduleReaderFind;
+    
+    private final class LoadedModule {
+        private final Object reader; // LaunchWrapper is written on a 1.8 JRE,  so we don't have access to ModuleReader
+        @SuppressWarnings("unused")
+        private final URL url;
+        
+        private LoadedModule(Object mref, URL url, Map<?,?> moduleToReader) {
+            this.reader = moduleToReader.get(mref);
+            this.url = url;
+            
+            if (moduleReaderFind == null)
+                try {
+                    moduleReaderFind = reader.getClass().getMethod("find", String.class);
+                } catch (NoSuchMethodException e) {
+                    throw new RuntimeException(e);
+                }
+        }
+        
+        private URL find(String name) {
+            try {
+                URI uri = AccessController.doPrivileged(new PrivilegedExceptionAction<URI>() {
+                    @SuppressWarnings("unchecked")
+                    @Override
+                    public URI run() throws Exception {
+                        return ((Optional<URI>) moduleReaderFind.invoke(reader, name)).orElse(null);
+                    }
+                });
+                
+                if (uri != null)
+                    try {
+                        return uri.toURL();
+                    } catch (MalformedURLException e) {
+                        // NOOP
+                    }
+            } catch (PrivilegedActionException e) {
+                // NOOP
+            }
+            
+            return null;
+        }
+    }
+    
+    private final List<LoadedModule> modules = new ArrayList<>();
 
-    public LaunchClassLoader(URL[] sources) {
-        super(sources, null);
-        this.sources = new ArrayList<URL>(Arrays.asList(sources));
+    public LaunchClassLoader() {
+        super(findSources(), null);
+        this.sources = new ArrayList<URL>(Arrays.asList(getURLs()));
 
         // classloader exclusions
         addClassLoaderExclusion("java.");
@@ -77,6 +150,87 @@ public class LaunchClassLoader extends URLClassLoader {
                 tempFolder.mkdirs();
             }
         }
+        
+        if (!(parent instanceof URLClassLoader))
+            initModules();
+    }
+    
+    @SuppressWarnings("unchecked")
+    private static URL[] findSources() {
+        ClassLoader classLoader = LaunchClassLoader.class.getClassLoader();
+        if (classLoader instanceof URLClassLoader)
+            return ((URLClassLoader) classLoader).getURLs();
+        
+        // Java 9 time
+        Class<?> loaderType = classLoader.getClass();
+        if (!loaderType.getName().startsWith("jdk.internal.loader."))
+            throw new IllegalStateException("Unsupported class loader: " + loaderType.getName());
+        
+        if (loaderType.getName().equals("jdk.internal.loader.ClassLoaders$AppClassLoader"))
+            loaderType = loaderType.getSuperclass();
+        
+        // Now we know loaderType is either Loader or BuiltinClassLoader.
+        
+        try {
+            Field ucpField = loaderType.getDeclaredField("ucp");
+            ucpField.setAccessible(true);
+            Object ucp = ucpField.get(classLoader);
+            
+            Field pathField = ucp.getClass().getDeclaredField("path");
+            pathField.setAccessible(true);
+            List<URL> urls = (List<URL>) pathField.get(ucp);
+            
+            return urls.toArray(new URL[urls.size()]);
+        } catch (NoSuchFieldException | SecurityException | IllegalArgumentException | IllegalAccessException e) {
+            throw new IllegalStateException("The module loader system is not in the expected format.", e);
+        }
+    }
+    
+    @SuppressWarnings("unchecked")
+    private void initModules() {
+        Class<?> loaderClass = parent.getClass();
+        if (loaderClass.getName().equals("jdk.internal.loader.ClassLoaders$AppClassLoader"))
+            loaderClass = loaderClass.getSuperclass();
+        
+        loaderType = (Class<? extends SecureClassLoader>) loaderClass; // Both Loader and BuiltinClassLoader extend SecureClassLoader.
+        
+        registerTransformer("net.minecraft.launchwrapper.injector.ModuleInjector");
+        
+        try {
+            String moduleMapFieldName = loaderClass.getName().equals("jdk.internal.loader.BuiltinClassLoader") ? "packageToModule" : "localPackageToModule";
+            Field moduleMapField = loaderType.getDeclaredField(moduleMapFieldName);
+            moduleMapField.setAccessible(true);
+            Map<?,?> map = (Map<?, ?>) moduleMapField.get(parent);
+            
+            Collection<?> modules = map.values();
+            if (modules.size() == 0)
+                return;
+            
+            Field moduleReaderField = loaderType.getDeclaredField("moduleToReader");
+            moduleReaderField.setAccessible(true);
+            Map<?,?> moduleToReader = (Map<?, ?>) moduleReaderField.get(parent);
+            
+            Class<?> moduleType = modules.iterator().next().getClass();
+            
+            Field mrefField = moduleType.getDeclaredField("mref");
+            mrefField.setAccessible(true);
+            
+            String urlFieldName = loaderClass.getName().equals("jdk.internal.loader.BuiltinClassLoader") ? "codeSourceURL" : "url";
+            Field urlField = moduleType.getDeclaredField(urlFieldName);
+            urlField.setAccessible(true);
+            
+            for (Object module : modules) {
+                Object mref = mrefField.get(module);
+                URL url = (URL) urlField.get(module);
+                this.modules.add(new LoadedModule(mref, url, moduleToReader));
+            }
+        } catch (NoSuchFieldException | IllegalArgumentException | IllegalAccessException e) {
+            throw new IllegalStateException("The module loader system is not in the expected format.", e);
+        }
+    }
+    
+    public void loadModule(Object module) {
+        
     }
 
     public void registerTransformer(String transformerClassName) {
@@ -370,6 +524,24 @@ public class LaunchClassLoader extends URLClassLoader {
         } finally {
             closeSilently(classStream);
         }
+    }
+    
+    @Override
+    public URL findResource(String name) {
+        URL classpathUrl = super.findResource(name);
+        if (classpathUrl != null)
+            return classpathUrl;
+        
+        if (loaderType == null)
+            return null;
+        
+        for (LoadedModule module : modules) {
+            URL url = module.find(name);
+            if (url != null)
+                return url;
+        }
+        
+        return null;
     }
 
     private static void closeSilently(Closeable closeable) {
