@@ -9,6 +9,7 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -34,11 +35,14 @@ public final class ModuleInjector implements IClassTransformer {
                                 minsn.name = "defineModulesWithOneLoader";
                             
                             if (minsn.name.equals("defineModulesWithOneLoader")) {
-                                method.instructions.insertBefore(minsn, new MethodInsnNode(Opcodes.INVOKESTATIC, "net/minecraft/launchwrapper/injector/ModuleInjector", "interceptLoader", "(Ljava/lang/ClassLoader;)Ljava/lang/ClassLoader;"));
+                                method.instructions.insertBefore(minsn, new FieldInsnNode(Opcodes.INVOKESTATIC, "net/minecraft/launchwrapper/Launch", "classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;"));
+                                method.instructions.insertBefore(minsn, new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/ClassLoader"));
                                 
                                 InsnList afterList = new InsnList();
                                 afterList.add(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Object"));
                                 afterList.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "net/minecraft/launchwrapper/injector/ModuleInjector", "onModuleLoad", "(Ljava/lang/Object;)Ljava/lang/Object;"));
+                                
+                                method.instructions.insert(minsn, afterList);
                             }
                         }
                     }
@@ -47,10 +51,6 @@ public final class ModuleInjector implements IClassTransformer {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         clazz.accept(cw);
         return cw.toByteArray();
-    }
-    
-    public static ClassLoader interceptLoader(ClassLoader classLoader) { // Param classLoader is to eat the class loader off the caller's stack.
-        return new DelegatingClassLoader();
     }
     
     @SuppressWarnings("unchecked")
@@ -77,12 +77,5 @@ public final class ModuleInjector implements IClassTransformer {
         }
         
         return controller;
-    }
-    
-    private static final class DelegatingClassLoader extends ClassLoader {
-        @Override
-        protected Class<?> findClass(String name) throws ClassNotFoundException {
-            return Launch.classLoader.loadClass(name);
-        }
     }
 }
